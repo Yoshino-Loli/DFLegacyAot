@@ -14,6 +14,10 @@ builder.Logging.AddSimpleConsole(console =>
     console.TimestampFormat = "HH:mm:ss ";
 });
 builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning);
+// Native AOT cannot build JSON metadata through reflection, so the admin API
+// resolves every payload shape from the source-generated context instead.
+builder.Services.ConfigureHttpJsonOptions(json =>
+    json.SerializerOptions.TypeInfoResolverChain.Insert(0, ApiJsonContext.Default));
 builder.Configuration.AddJsonFile(
     Path.Combine(AppContext.BaseDirectory, "server.json"),
     optional: false,
@@ -185,33 +189,31 @@ app.MapGet("/client/client_pay", () => Results.Redirect("/client/client_pay.htm"
 app.MapGet("/client/client_diamond", () => Results.Redirect("/client/client_diamond.htm"));
 app.MapGet("/admin", () => Results.Redirect("/admin/index.html"));
 
-app.MapGet("/health", () => Results.Ok(new { status = "ok", service = "dflegacy-emulator" }));
+app.MapGet("/health", () => Results.Ok(new HealthResponse("ok", "dflegacy-emulator")));
 
-app.MapGet("/api/status", (RuntimeState runtime, ScriptFileSystem scripts, ItemCatalog items) => Results.Ok(new
-{
+app.MapGet("/api/status", (RuntimeState runtime, ScriptFileSystem scripts, ItemCatalog items) => Results.Ok(new ServerStatusResponse(
     runtime.StartedAt,
     runtime.TotalConnections,
     runtime.TotalPackets,
-    ActiveSessions = runtime.Sessions().Length,
-    Entrance = new[] { options.Entrance.Port }
+    runtime.Sessions().Length,
+    new[] { options.Entrance.Port }
         .Concat(options.Entrance.AdditionalPorts)
         .Distinct()
         .Select(port => $"{options.Entrance.Host}:{port}"),
-    CharacterDatagram = options.CharacterDatagram.Enabled
+    options.CharacterDatagram.Enabled
         ? $"{options.CharacterDatagram.Host}:{options.CharacterDatagram.Port}/udp"
         : "disabled",
-    GameplayDatagram = options.GameplayDatagram.Enabled
+    options.GameplayDatagram.Enabled
         ? new[]
         {
             $"{options.GameplayDatagram.Host}:{options.GameplayDatagram.PrimaryPort}/udp",
             $"{options.GameplayDatagram.Host}:{options.GameplayDatagram.SecondaryPort}/udp"
         }
-        : [],
-    GameProbe = options.GameProbe.Enabled ? $"{options.GameProbe.Host}:{options.GameProbe.Port}" : "disabled",
-    Random = GameRandomSource.Shared.GetStatus(),
-    ChannelScriptConfigured = scripts.FileExists("etc/channel_info.etc"),
-    CachedItems = items.Count
-}));
+        : Array.Empty<string>(),
+    options.GameProbe.Enabled ? $"{options.GameProbe.Host}:{options.GameProbe.Port}" : "disabled",
+    GameRandomSource.Shared.GetStatus(),
+    scripts.FileExists("etc/channel_info.etc"),
+    items.Count)));
 
 app.MapGet("/api/sessions", (RuntimeState runtime) => Results.Ok(runtime.Sessions()));
 app.MapGet("/api/packets", (RuntimeState runtime) => Results.Ok(runtime.RecentPackets()));
@@ -225,21 +227,21 @@ app.MapGet("/api/admin/characters", async (
 {
     var accounts = await store.GetAccountsAsync(token);
     return Results.Ok(accounts
-        .SelectMany(account => account.Characters.Select(character => new
-        {
-            character.Id,
-            character.CharacterNo,
-            character.Name,
-            character.Job,
-            character.GrowType,
-            character.Level,
-            account.UserName,
-            account.AccountUid,
-            Online = sessions.IsOnline(character.Id)
-        }))
+        .SelectMany(account => account.Characters.Select(character =>
+            new AdminCharacterSummary(
+                character.Id,
+                character.CharacterNo,
+                character.Name,
+                character.Job,
+                character.GrowType,
+                character.Level,
+                account.UserName,
+                account.AccountUid,
+                sessions.IsOnline(character.Id))))
         .OrderByDescending(character => character.Online)
         .ThenBy(character => character.UserName, StringComparer.OrdinalIgnoreCase)
-        .ThenBy(character => character.CharacterNo));
+        .ThenBy(character => character.CharacterNo)
+        .ToArray());
 });
 
 app.MapGet("/api/admin/items", (
@@ -251,7 +253,7 @@ app.MapGet("/api/admin/items", (
     if (kind.HasValue
         && (kind == AdminMailAttachmentKind.None || !Enum.IsDefined(kind.Value)))
     {
-        return Results.BadRequest(new { error = "kind must be Item, Avatar or CreatureEgg." });
+        return Results.BadRequest(new ErrorResponse("kind must be Item, Avatar or CreatureEgg."));
     }
 
     var normalizedQuery = query?.Trim() ?? string.Empty;
@@ -274,21 +276,20 @@ app.MapGet("/api/admin/items", (
             definition.Id.ToString() == normalizedQuery)
         .ThenBy(definition => definition.Id)
         .Take(maximum)
-        .Select(definition => new
-        {
+        .Select(definition => new AdminItemSummary(
             definition.Id,
-            Name = string.IsNullOrWhiteSpace(definition.Name)
+            string.IsNullOrWhiteSpace(definition.Name)
                 ? $"Item {definition.Id}"
                 : definition.Name,
-            AttachmentKind = AdminMailComposer.GetAttachmentKind(definition),
-            ScriptKind = definition.ScriptKind.ToString(),
-            InventoryCategory = definition.InventoryCategory.ToString(),
+            AdminMailComposer.GetAttachmentKind(definition),
+            definition.ScriptKind.ToString(),
+            definition.InventoryCategory.ToString(),
             definition.TypeTag,
-            AttachType = definition.AttachType.ToString(),
+            definition.AttachType.ToString(),
             definition.StackLimit,
-            Durability = items.GetInitialDurability(definition.Id),
-            definition.ScriptPath
-        });
+            items.GetInitialDurability(definition.Id),
+            definition.ScriptPath))
+        .ToArray();
     return Results.Ok(result);
 });
 
@@ -296,22 +297,18 @@ app.MapGet("/api/admin/dungeons", (DungeonCatalog dungeons) => Results.Ok(
     dungeons.DungeonIds.Select(dungeonId =>
     {
         dungeons.TryGetDefinition(dungeonId, out var definition);
-        return new
-        {
-            DungeonId = dungeonId,
+        return new AdminDungeonSummary(
+            dungeonId,
             definition.MinimumLevel,
             definition.BasisLevel,
             definition.IsHellDungeon,
-            definition.GoldCardUse
-        };
-    })));
+            definition.GoldCardUse);
+    }).ToArray()));
 
 app.MapGet("/api/admin/message-types", () => Results.Ok(
-    Enum.GetValues<GameMessageType>().Select(messageType => new
-    {
-        Value = (byte)messageType,
-        Name = messageType.ToString()
-    })));
+    Enum.GetValues<GameMessageType>().Select(messageType => new AdminMessageTypeOption(
+        (byte)messageType,
+        messageType.ToString())).ToArray()));
 
 app.MapPost("/api/admin/characters/{characterId:guid}/mail", async (
     Guid characterId,
@@ -323,7 +320,7 @@ app.MapPost("/api/admin/characters/{characterId:guid}/mail", async (
 {
     if (!AdminMailComposer.TryCompose(request, items, out var mailRequest, out var error))
     {
-        return Results.BadRequest(new { error });
+        return Results.BadRequest(new ErrorResponse(error));
     }
 
     try
@@ -333,22 +330,19 @@ app.MapPost("/api/admin/characters/{characterId:guid}/mail", async (
     }
     catch (EncoderFallbackException)
     {
-        return Results.BadRequest(new
-        {
-            error = "Mail sender or text contains characters that cannot be encoded as CP936."
-        });
+        return Results.BadRequest(new ErrorResponse("Mail sender or text contains characters that cannot be encoded as CP936."));
     }
 
     var result = await store.SendCharacterMailAsync(characterId, mailRequest, token);
     if (!result.Created)
     {
-        return Results.BadRequest(new { error = result.Error });
+        return Results.BadRequest(new ErrorResponse(result.Error));
     }
 
     var notifiedOnlineCharacter = sessions.NotifyMailReceived(characterId);
     return Results.Created(
         $"/api/characters/{characterId}/mail/{result.Mail!.Id}",
-        new { result.Mail, NotifiedOnlineCharacter = notifiedOnlineCharacter });
+        new MailSentResponse(result.Mail, notifiedOnlineCharacter));
 });
 
 app.MapPost("/api/admin/broadcast/message", (
@@ -357,12 +351,12 @@ app.MapPost("/api/admin/broadcast/message", (
 {
     if (string.IsNullOrEmpty(request.Message))
     {
-        return Results.BadRequest(new { error = "Message must not be empty." });
+        return Results.BadRequest(new ErrorResponse("Message must not be empty."));
     }
 
     if (!Enum.IsDefined(request.MessageType))
     {
-        return Results.BadRequest(new { error = "MessageType is not supported." });
+        return Results.BadRequest(new ErrorResponse("MessageType is not supported."));
     }
 
     byte[] messageBytes;
@@ -372,32 +366,24 @@ app.MapPost("/api/admin/broadcast/message", (
     }
     catch (EncoderFallbackException)
     {
-        return Results.BadRequest(new
-        {
-            error = "Message contains characters that cannot be encoded as CP936."
-        });
+        return Results.BadRequest(new ErrorResponse("Message contains characters that cannot be encoded as CP936."));
     }
 
     if (messageBytes.Length >= 0x100)
     {
-        return Results.BadRequest(new
-        {
-            error = "CP936-encoded message must be shorter than 256 bytes."
-        });
+        return Results.BadRequest(new ErrorResponse("CP936-encoded message must be shorter than 256 bytes."));
     }
 
     var recipients = sessions.NotifyMessageAll(
         request.MessageType,
         request.TargetAreaUserId,
         messageBytes);
-    return Results.Ok(new
-    {
-        queued = true,
+    return Results.Ok(new BroadcastMessageResponse(
+        true,
         recipients,
         request.MessageType,
         request.TargetAreaUserId,
-        encodedLength = messageBytes.Length
-    });
+        messageBytes.Length));
 });
 
 app.MapPost("/api/admin/broadcast/popup", (
@@ -406,7 +392,7 @@ app.MapPost("/api/admin/broadcast/popup", (
 {
     if (string.IsNullOrEmpty(request.Message))
     {
-        return Results.BadRequest(new { error = "Message must not be empty." });
+        return Results.BadRequest(new ErrorResponse("Message must not be empty."));
     }
 
     byte[] messageBytes;
@@ -416,27 +402,19 @@ app.MapPost("/api/admin/broadcast/popup", (
     }
     catch (EncoderFallbackException)
     {
-        return Results.BadRequest(new
-        {
-            error = "Message contains characters that cannot be encoded as CP936."
-        });
+        return Results.BadRequest(new ErrorResponse("Message contains characters that cannot be encoded as CP936."));
     }
 
     if (messageBytes.Length >= 0x100)
     {
-        return Results.BadRequest(new
-        {
-            error = "CP936-encoded message must be shorter than 256 bytes."
-        });
+        return Results.BadRequest(new ErrorResponse("CP936-encoded message must be shorter than 256 bytes."));
     }
 
     var recipients = sessions.NotifyPopupAll(messageBytes);
-    return Results.Ok(new
-    {
-        queued = true,
+    return Results.Ok(new BroadcastPopupResponse(
+        true,
         recipients,
-        encodedLength = messageBytes.Length
-    });
+        messageBytes.Length));
 });
 
 app.MapPut("/api/admin/characters/{characterId:guid}/dungeons/{dungeonId:int}", async (
@@ -451,12 +429,12 @@ app.MapPut("/api/admin/characters/{characterId:guid}/dungeons/{dungeonId:int}", 
     if (dungeonId is <= 0 or > ushort.MaxValue
         || !dungeons.TryGetDefinition((ushort)dungeonId, out _))
     {
-        return Results.BadRequest(new { error = "Dungeon id is not present in the loaded PVF." });
+        return Results.BadRequest(new ErrorResponse("Dungeon id is not present in the loaded PVF."));
     }
 
     if (request.MaximumDifficulty > DungeonDifficultyProgression.HighestDifficulty)
     {
-        return Results.BadRequest(new { error = "MaximumDifficulty must be between 0 and 3." });
+        return Results.BadRequest(new ErrorResponse("MaximumDifficulty must be between 0 and 3."));
     }
 
     var updated = await store.SetCharacterDungeonDifficultyAsync(
@@ -466,20 +444,18 @@ app.MapPut("/api/admin/characters/{characterId:guid}/dungeons/{dungeonId:int}", 
         token);
     if (updated is null)
     {
-        return Results.NotFound(new { error = "Character does not exist." });
+        return Results.NotFound(new ErrorResponse("Character does not exist."));
     }
 
     var notifiedOnlineCharacter = sessions.NotifyDungeonPermission(
         characterId,
         (ushort)dungeonId,
         request.MaximumDifficulty);
-    return Results.Ok(new
-    {
+    return Results.Ok(new DungeonDifficultyResponse(
         characterId,
-        DungeonId = (ushort)dungeonId,
+        (ushort)dungeonId,
         request.MaximumDifficulty,
-        NotifiedOnlineCharacter = notifiedOnlineCharacter
-    });
+        notifiedOnlineCharacter));
 });
 
 // These client-pay mutations are intentionally on the loopback admin listener;
@@ -586,8 +562,8 @@ app.MapPost("/api/accounts", async (CreateAccountRequest request, JsonGameStore 
     }
 
     return string.Equals(result.Error, "账号已存在。", StringComparison.Ordinal)
-        ? Results.Conflict(new { error = result.Error })
-        : Results.BadRequest(new { error = result.Error });
+        ? Results.Conflict(new ErrorResponse(result.Error))
+        : Results.BadRequest(new ErrorResponse(result.Error));
 });
 
 app.MapPut("/api/accounts/{userName}/password", async (
@@ -629,7 +605,7 @@ app.MapPost("/api/accounts/{userName}/characters", async (
     var result = await store.CreateCharacterAsync(userName, request, token);
     return result.Created
         ? Results.Created($"/api/accounts/{userName}/characters/{result.Character!.Id}", result.Character)
-        : Results.BadRequest(new { error = result.Error });
+        : Results.BadRequest(new ErrorResponse(result.Error));
 });
 
 app.MapPut("/api/characters/{characterId:guid}/fatigue", async (
@@ -640,10 +616,8 @@ app.MapPut("/api/characters/{characterId:guid}/fatigue", async (
 {
     if (request.UsedFatigue > GameProtocolEngine.BlackDiamondMaximumFatigue)
     {
-        return Results.BadRequest(new
-        {
-            error = $"Used fatigue must be between 0 and {GameProtocolEngine.BlackDiamondMaximumFatigue}."
-        });
+        return Results.BadRequest(new ErrorResponse(
+            $"Used fatigue must be between 0 and {GameProtocolEngine.BlackDiamondMaximumFatigue}."));
     }
 
     var character = await store.SetCharacterUsedFatigueAsync(
@@ -671,7 +645,7 @@ app.MapPost("/api/characters/{characterId:guid}/mail", async (
     var result = await store.SendCharacterMailAsync(characterId, request, token);
     if (!result.Created)
     {
-        return Results.BadRequest(new { error = result.Error });
+        return Results.BadRequest(new ErrorResponse(result.Error));
     }
 
     sessions.NotifyMailReceived(characterId);
@@ -687,15 +661,12 @@ app.MapPost("/api/characters/{characterId:guid}/message", (
 {
     if (string.IsNullOrEmpty(request.Message))
     {
-        return Results.BadRequest(new { error = "Message must not be empty." });
+        return Results.BadRequest(new ErrorResponse("Message must not be empty."));
     }
 
     if (!Enum.IsDefined(request.MessageType))
     {
-        return Results.BadRequest(new
-        {
-            error = "MessageType must be a defined DFLegacy client message type."
-        });
+        return Results.BadRequest(new ErrorResponse("MessageType must be a defined DFLegacy client message type."));
     }
 
     byte[] messageBytes;
@@ -705,18 +676,12 @@ app.MapPost("/api/characters/{characterId:guid}/message", (
     }
     catch (EncoderFallbackException)
     {
-        return Results.BadRequest(new
-        {
-            error = "Message contains characters that cannot be encoded as CP936."
-        });
+        return Results.BadRequest(new ErrorResponse("Message contains characters that cannot be encoded as CP936."));
     }
 
     if (messageBytes.Length >= 0x100)
     {
-        return Results.BadRequest(new
-        {
-            error = "CP936-encoded message must be shorter than 256 bytes."
-        });
+        return Results.BadRequest(new ErrorResponse("CP936-encoded message must be shorter than 256 bytes."));
     }
 
     if (!sessions.NotifyMessage(
@@ -725,17 +690,15 @@ app.MapPost("/api/characters/{characterId:guid}/message", (
             request.TargetAreaUserId,
             messageBytes))
     {
-        return Results.Conflict(new { error = "Character is not online." });
+        return Results.Conflict(new ErrorResponse("Character is not online."));
     }
 
-    return Results.Ok(new
-    {
-        queued = true,
+    return Results.Ok(new CharacterMessageResponse(
+        true,
         characterId,
         request.MessageType,
         request.TargetAreaUserId,
-        encodedLength = messageBytes.Length
-    });
+        messageBytes.Length));
 });
 
 app.MapPost("/api/characters/{characterId:guid}/popup", (
@@ -745,7 +708,7 @@ app.MapPost("/api/characters/{characterId:guid}/popup", (
 {
     if (string.IsNullOrEmpty(request.Message))
     {
-        return Results.BadRequest(new { error = "Message must not be empty." });
+        return Results.BadRequest(new ErrorResponse("Message must not be empty."));
     }
 
     byte[] messageBytes;
@@ -755,31 +718,23 @@ app.MapPost("/api/characters/{characterId:guid}/popup", (
     }
     catch (EncoderFallbackException)
     {
-        return Results.BadRequest(new
-        {
-            error = "Message contains characters that cannot be encoded as CP936."
-        });
+        return Results.BadRequest(new ErrorResponse("Message contains characters that cannot be encoded as CP936."));
     }
 
     if (messageBytes.Length >= 0x100)
     {
-        return Results.BadRequest(new
-        {
-            error = "CP936-encoded message must be shorter than 256 bytes."
-        });
+        return Results.BadRequest(new ErrorResponse("CP936-encoded message must be shorter than 256 bytes."));
     }
 
     if (!sessions.NotifyPopup(characterId, messageBytes))
     {
-        return Results.Conflict(new { error = "Character is not online." });
+        return Results.Conflict(new ErrorResponse("Character is not online."));
     }
 
-    return Results.Ok(new
-    {
-        queued = true,
+    return Results.Ok(new CharacterPopupResponse(
+        true,
         characterId,
-        encodedLength = messageBytes.Length
-    });
+        messageBytes.Length));
 });
 
 app.MapGet("/", () => Results.Text(

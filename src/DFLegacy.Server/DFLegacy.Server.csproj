@@ -8,6 +8,19 @@
     <RandomNativeBinary>$(MSBuildProjectDirectory)\..\..\artifacts\native\random\$(Configuration)\DFLegacy.RandomNative.dll</RandomNativeBinary>
     <BuildRandomNativeReference Condition="'$(MSBuildRuntimeType)' == 'Full' and ('$(BuildingSolutionFile)' == 'true' or '$(BuildingInsideVisualStudio)' == 'true')">true</BuildRandomNativeReference>
   </PropertyGroup>
+  <PropertyGroup Condition="'$(PublishAot)' == 'true'">
+    <EnableConfigurationBindingGenerator>true</EnableConfigurationBindingGenerator>
+    <!-- Size trims: no EventSource/MetadataUpdater/Activity plumbing, no
+         resource strings for framework exceptions, no stack-trace metadata. -->
+    <EventSourceSupport>false</EventSourceSupport>
+    <MetadataUpdaterSupport>false</MetadataUpdaterSupport>
+    <HttpActivityPropagationSupport>false</HttpActivityPropagationSupport>
+    <UseSystemResourceKeys>true</UseSystemResourceKeys>
+    <StackTraceSupport>false</StackTraceSupport>
+    <OptimizationPreference>Size</OptimizationPreference>
+    <!-- Native AOT symbols for this assembly are ~120 MB; ship without them. -->
+    <DebugType>none</DebugType>
+  </PropertyGroup>
   <ItemGroup>
     <Content Update="wwwroot\**">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>

@@ -504,7 +504,7 @@ public sealed class JsonGameStore(
     private uint _nextTestAccountUid = 1;
     private int _fatigueDayKey;
 
-    private sealed class JsonGameStoreState
+    internal sealed class JsonGameStoreState
     {
         public List<AccountRecord> Accounts { get; set; } = [];
         public uint NextCharacterNo { get; set; } = 1;
@@ -527,7 +527,11 @@ public sealed class JsonGameStore(
                 var stateChanged = false;
                 if (document.RootElement.ValueKind == JsonValueKind.Array)
                 {
-                    _accounts = JsonSerializer.Deserialize<List<AccountRecord>>(json) ?? [];
+                    _accounts = JsonSerializer.Deserialize(
+                            json,
+                            typeof(List<AccountRecord>),
+                            StorageJsonContext.Default) as List<AccountRecord>
+                        ?? [];
                     _nextCharacterNo = 1;
                     _nextNormalAccountUid = AccountUidRules.NormalUidStart;
                     _nextTestAccountUid = 1;
@@ -536,7 +540,10 @@ public sealed class JsonGameStore(
                 }
                 else
                 {
-                    var state = JsonSerializer.Deserialize<JsonGameStoreState>(json)
+                    var state = JsonSerializer.Deserialize(
+                            json,
+                            typeof(JsonGameStoreState),
+                            StorageJsonContext.Default) as JsonGameStoreState
                         ?? new JsonGameStoreState();
                     _accounts = state.Accounts ?? [];
                     _nextCharacterNo = state.NextCharacterNo == 0
@@ -5452,7 +5459,8 @@ public sealed class JsonGameStore(
                     NextTestAccountUid = _nextTestAccountUid,
                     FatigueDayKey = _fatigueDayKey
                 },
-                new JsonSerializerOptions { WriteIndented = true },
+                typeof(JsonGameStoreState),
+                StorageJsonContext.Default,
                 cancellationToken);
         }
 
