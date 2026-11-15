@@ -1,13 +1,21 @@
-# DFLegacy
+# DFLegacyAot
 
 <a href="#运行环境"><img src="https://img.shields.io/badge/Windows-0078D4" alt="Windows" /></a>
 <a href="#构建与启动"><img src="https://img.shields.io/badge/.NET-10-512BD4" alt=".NET 10" /></a>
 <a href="#模块说明"><img src="https://img.shields.io/badge/UI-Web-7A3E9D" alt="Web UI" /></a>
 <br />
+<a href="#native-aot-构建"><img src="https://img.shields.io/badge/Native-AOT-5C2D91" alt="Native AOT" /></a>
 <a href="#运行环境"><img src="https://img.shields.io/badge/architecture-x86%20%2F%20x64-455A64" alt="x86 / x64" /></a>
 <a href="#许可证"><img src="https://img.shields.io/badge/license-0BSD-2E7D32" alt="0BSD License" /></a>
 
 面向赛里斯服公测 ACT1 客户端的本地模拟服务端、启动器与客户端补丁。
+
+> **本仓库是 [shizuku30/DFLegacy](https://github.com/shizuku30/DFLegacy) 的 fork**，基于上游
+> `35b18da`，在其之上增加了 **Native AOT** 发布支持。上游功能未作删减，改动集中在 JSON
+> 序列化方式与发布配置，详见 [Native AOT 构建](#native-aot-构建)。
+>
+> 预编译产物见 [Releases](https://github.com/Yoshino-Loli/DFLegacyAot/releases)。
+
 
 项目从 `Script.pvf` 读取客户端配置数据，并将用户数据在本地持久化。
 
@@ -74,6 +82,7 @@
 - Windows；客户端及 IJL15 为 32 位，硬件随机桥接为 64 位，建议使用 64 位 .NET 运行服务端。
 - 从源码构建需要 .NET 10 SDK、带桌面 C++ 开发组件的 Visual Studio，以及 CMake。
 - 使用下述默认发布方式运行时，需要相应的 .NET 10 运行时，包括 ASP.NET Core 和 Windows Desktop 运行时；安装 SDK 的开发机通常已具备。
+- 使用 [Native AOT 构建](#native-aot-构建) 时不需要安装 .NET 运行时，仅需 64 位 Windows 10/11。
 - 通过 Launcher 启动需要可用的图形桌面。启动器会检查 Direct3D 9 HAL 设备，远程或无显示环境可能无法通过检查。
 
 ## 构建与启动
@@ -106,6 +115,78 @@ dotnet publish .\src\DFLegacy.Launcher\DFLegacy.Launcher.csproj -c Release -o .\
 ```
 
 更新前备份数据，避免覆盖现有存档。不要同时启动多个实例写入同一份状态文件。
+
+## Native AOT 构建
+
+服务端可以编译为单文件原生可执行，不再依赖本机 .NET 运行时。
+
+| | 默认发布 | Native AOT |
+| --- | --- | --- |
+| 目录体积 | 109 MB | **18 MB** |
+| 主程序 | 332 个 DLL | **单文件 17.1 MB** |
+| 运行时依赖 | .NET 10 + ASP.NET Core | **无** |
+| 启动到监听 | 2070 ms | **1048 ms** |
+
+### 构建
+
+Native AOT 需要 MSVC 链接器与 Windows SDK。若它们不在默认位置（例如装在 `E:\`），
+`dotnet publish` 会在链接阶段报 `LNK1181: 无法打开输入文件 "advapi32.lib"`，
+此时先导出 `LIB` / `INCLUDE` 指向实际的工具集与 SDK 目录：
+
+```powershell
+$env:LIB = '<MSVC>\lib\x64;<SDK>\Lib\<版本>\um\x64;<SDK>\Lib\<版本>\ucrt\x64'
+$env:INCLUDE = '<MSVC>\include;<SDK>\Include\<版本>\um;<SDK>\Include\<版本>\ucrt;<SDK>\Include\<版本>\shared'
+```
+
+```powershell
+dotnet publish .\src\DFLegacy.Server\DFLegacy.Server.csproj -c Release -r win-x64 `
+  -p:PublishAot=true -p:BuildRandomNativeReference=false -o .\dist\aot
+```
+
+产物是单个 `DFLegacy.Server.exe`，同目录需保留 `wwwroot`、`server.json` 与
+`DFLegacy.Server.staticwebassets.endpoints.json`。
+
+`-p:BuildRandomNativeReference=false` 会跳过 64 位原生随机桥接，服务端自动回退到
+操作系统 CSPRNG，功能不受影响。
+
+### 为 AOT 做的代码调整
+
+Native AOT 不支持运行期反射式 JSON 序列化 —— `DefaultJsonTypeInfoResolver` 会在
+`MakeGenericType` 处失败（典型报错 `JsonPropertyInfo`1[...] is missing native code`）。
+因此：
+
+- `ApiContracts.cs` 提供两个 source-generated 上下文：
+  - `StorageJsonContext`：存档用，保持 PascalCase 与缩进，与历史存档字节兼容；
+  - `ApiJsonContext`：HTTP 用，camelCase、大小写不敏感、数字可从字符串读取，
+    与 ASP.NET Core 的 web 默认值一致。
+- 管理接口的匿名返回对象全部改为命名 record，LINQ 投影一律 `.ToArray()`。
+- `Program.cs` 通过 `ConfigureHttpJsonOptions` 把 `ApiJsonContext` 插入解析器链。
+- 配置绑定启用 `EnableConfigurationBindingGenerator`。
+
+> **新增接口时必须把返回类型注册到 `ApiJsonContext`**，否则该接口会在运行期抛
+> `NotSupportedException`，编译期不会报错。返回集合时先 `.ToArray()`，不要把
+> `IEnumerable<T>` 直接交给 `Results.Ok`。
+
+### 体积开关与取舍
+
+`DFLegacy.Server.csproj` 在 `PublishAot=true` 时启用下列开关：
+
+```xml
+<OptimizationPreference>Size</OptimizationPreference>
+<UseSystemResourceKeys>true</UseSystemResourceKeys>
+<StackTraceSupport>false</StackTraceSupport>
+<EventSourceSupport>false</EventSourceSupport>
+<MetadataUpdaterSupport>false</MetadataUpdaterSupport>
+<HttpActivityPropagationSupport>false</HttpActivityPropagationSupport>
+<DebugType>none</DebugType>
+```
+
+体积从 25.3 MB 降到 17.1 MB。代价是 .NET 框架级异常不再有资源字符串与堆栈行号，
+业务自身的错误消息不受影响。需要排查问题时去掉 `UseSystemResourceKeys` 与
+`StackTraceSupport` 重新发布即可，体积回到约 21 MB。
+
+`DebugType=none` 之后，`obj` 中上一次构建遗留的 PDB 仍会被 publish 复制到输出目录，
+构建前先 `dotnet clean` 或手动删除。
 
 ## 常用配置
 
