@@ -10,6 +10,7 @@
 
 #include "dnf_patches.h"
 #include "d3d8_scaler.h"
+#include "launcher_bootstrap.h"
 #include "external_string_table.h"
 #include "ijl15_config.h"
 #include "message_audio.h"
@@ -1148,6 +1149,10 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID)
     if (reason == DLL_PROCESS_ATTACH
         && dfl::dnf_patches::IsTargetProcess())
     {
+        // Install the entrance arguments first: this runs before the client
+        // entry point parses its command line, and it must still happen when
+        // any of the code patches below fail to apply.
+        dfl::launcher_bootstrap::Apply();
         return dfl::dnf_patches::Apply() ? TRUE : FALSE;
     }
     return TRUE;

@@ -27,6 +27,8 @@ add_library(ijl15 SHARED
     src/ijl15_config.h
     src/ijl15.cpp
     src/ijl15.def
+    src/launcher_bootstrap.cpp
+    src/launcher_bootstrap.h
     src/message_audio.cpp
     src/message_audio.h
     src/memory_patch.cpp
